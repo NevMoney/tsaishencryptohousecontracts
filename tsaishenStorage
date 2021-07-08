@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.6.10;
+
+import "@openzeppelin/contracts/utils/EnumerableSet.sol";
+import "./libs/UniversalERC20.sol";
+
+contract Storage {
+    using EnumerableSet for EnumerableSet.AddressSet;
+    EnumerableSet.AddressSet internal users;
+
+    using EnumerableSet for EnumerableSet.UintSet;
+    using UniversalERC20 for IERC20;
+
+    mapping (uint256 => bool) _uintToBool;
+    mapping (address => address) _addressToAddress;
+    mapping (address => uint256) _addressToUint;
+    mapping (uint256 => bytes32) _uintToBytes;
+    mapping (uint256 => mapping (address => uint256)) _uintToAddressToUint;
+    mapping (address => mapping (address => uint256)) _addressToAddressToUint;
+
+    // house mapping
+    mapping (uint256 => House) internal houseInfo;
+
+    // user mapping
+    mapping (address => User) internal userInfo;
+
+    // escrow mapping
+    mapping (uint256 => Escrow) escrowById;
+
+    // marketplace mapping
+    mapping (address => address) availableOracles;
+    mapping (uint256 => Offer) internal offerDetails;
+    mapping (uint256 => Deed) deedInfo;
+
+    // promotion mapping
+    mapping (address => MyPromo) myPromotions;
+    mapping (address => mapping(uint256 => uint256)) sellerDeposits;
+
+    // marketplace array
+    Offer [] offers;
+    Escrow [] escrows;
+    Deed [] deeds;
+
+    // escrow options
+    enum State { Active, Refunding, Closed }
+    
+    // marketplace listing options
+    enum OfferState { Dormant, Active, Escrow }
+
+    struct House {
+        uint256 value;
+        uint256 income;
+    }
+
+    struct User {
+        address payable user;
+        bool houseOwner;
+        bool borrower;
+        bool lender;
+        bool reward;
+        uint points;
+        bool recruiter;
+        EnumerableSet.UintSet houses;
+    } 
+
+    struct Escrow {
+        IERC20 token; 
+        address payable seller; 
+        address payable buyer; 
+        State state;
+        uint256 amount;
+        uint256 timelock;
+        uint256 tokenId;
+        uint index;
+    }
+
+    struct Offer {
+        address payable seller;
+        uint256 price;
+        uint256 income;
+        uint256 index;
+        uint256 tokenId;
+        bool isPromoted;
+        OfferState offerstate;
+        EnumerableSet.AddressSet promoters;
+    }
+
+    struct Deed {
+        address seller;
+        address buyer;
+        uint256 tokenId;
+        uint256 index;
+        uint256 salePrice;
+        uint256 deedDate;
+        string deedHash;
+    }
+
+    struct MyPromo {
+        EnumerableSet.UintSet properties;
+    }
+
+}
