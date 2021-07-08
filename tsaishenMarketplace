@@ -1,0 +1,509 @@
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.6.10;
+
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/EnumerableSet.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "./tokens/HouseToken.sol";
+import "./TsaishenUsers.sol";
+import "./TsaishenEscrow.sol";
+
+// using Chainlink oracle for price tracking
+interface AggregatorV3Interface {
+
+  function decimals() external view returns (uint8);
+  function description() external view returns (string memory);
+  function version() external view returns (uint256);
+
+  function getRoundData(uint80 _roundId) external view returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
+
+  function latestRoundData() external view returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
+
+}
+
+contract Marketplace is ReentrancyGuard, TsaishenEscrow {
+    using SafeMath for uint256;
+    using Address for address payable;
+    using EnumerableSet for EnumerableSet.AddressSet;
+    EnumerableSet.AddressSet internal promoters;
+
+    event TokenAdded(address token);
+    event TokenDeleted(address token);
+    event UriUpdated(uint256 tokenId, string ipfsHash, address from);
+    event HouseListed(address seller, uint256 tokenId, uint256 price);
+    event OfferRemoved(address seller, uint256 tokenId);
+    event HousePurchased(address buyer, address seller, uint256 tokenId);
+    event HouseInEscrow(address buyer, address seller, uint256 tokenId);
+    event EscrowRefunded(address buyer, address seller, uint256 tokenId);
+    event ReviewRequest(address buyer, address seller, uint256 tokenId);
+    event EscrowClosed(address seller, uint256 tokenId);
+    event EscrowCancelled(address actor, uint256 tokenId);
+    event DocsUploaded(address seller, uint256 tokenId);
+    event PromoterSignedUp (address promoter, uint256 tokenId);
+    event PromotionEnabled (address seller, uint256 tokenId);
+    event PromotionCancelled (address seller, uint256 tokenId);
+    event PromoterPaid (address seller, address promoter, uint256 tokenId);
+   
+    // importing house token and user contract
+    HouseToken private _houseToken;
+    TsaishenUsers private _tsaishenUsers;
+    
+    // variables for setting house price, transaction fee, and balance tracking
+    uint256 housePrice = 100000000; // 1 USD
+    uint256 txFee = 1; 
+    uint public balance; 
+
+    // *** CONSTRUCTOR ***
+    constructor(
+        address _userContractAddress, 
+        address _houseTokenAddress, 
+        address payable _feeRecipient
+        ) public {
+        _tsaishenUsers = TsaishenUsers(_userContractAddress);
+        _houseToken = HouseToken(_houseTokenAddress);
+        feeRecipient = _feeRecipient;
+        addOracle(address(0), 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419); //ETH
+        addOracle(0x6B175474E89094C44Da98b954EedeAC495271d0F, 	0xAed0c38402a5d19df6E4c03F4E2DceD6e29c1ee9); //DAI
+        addOracle(0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48, 0x8fFfFfd4AfB6115b954Bd326cbe7B4BA576818f6); //USDC
+    }
+    
+    /*         *** GETTER ***
+    =====================================*/
+    // function to get price of a token and update time - Chainlink
+    function getOracleUsdPrice(address token) public view returns (int256, uint256) {
+        address oracleAddress = availableOracles[token];
+        require(oracleAddress != address(0), "MP1");
+
+        (, int256 answer, , uint256 updatedAt, ) = AggregatorV3Interface(oracleAddress).latestRoundData();
+        return (answer, updatedAt);
+    }
+
+    // function to get listed house offer information
+    function getOffer(uint256 _tokenId) public view returns 
+        (address seller, 
+        uint256 price, 
+        uint256 income, 
+        uint256 index, 
+        bool isPromoted,
+        OfferState offerstate,
+        bytes32[] memory) {
+        return 
+        (offerDetails[_tokenId].seller, 
+        offerDetails[_tokenId].price, 
+        offerDetails[_tokenId].income, 
+        offerDetails[_tokenId].index,
+        offerDetails[_tokenId].isPromoted,
+        offerDetails[_tokenId].offerstate,
+        offerDetails[_tokenId].promoters._inner._values); 
+    }
+
+    // function to get all items on sale in the marketplace
+    function getAllTokensOnSale() public view returns(uint256[] memory listOfOffers) {
+        uint256 forSaleList = offers.length;
+
+        if(forSaleList == 0) {
+            return new uint256[](0);
+        }
+        else{
+            uint256[] memory result = new uint256[](forSaleList);
+            uint256 offerId;
+
+            for(offerId = 0; offerId < forSaleList; offerId++)
+                if(offers[offerId].offerstate == OfferState.Active || offers[offerId].offerstate == OfferState.Escrow){
+                    result[offerId] = offers[offerId].tokenId;
+                }
+            return result;
+        }
+    }
+
+    // tracking of information inside deed
+    function getDeedInfo(uint256 _tokenId) public view returns
+        (address seller, 
+        address buyer, 
+        uint256 tokenId, 
+        uint256 index,
+        uint256 salePrice,
+        uint256 deedDate,
+        string memory deedHash) {
+        return 
+        (deedInfo[_tokenId].seller, 
+        deedInfo[_tokenId].buyer,
+        deedInfo[_tokenId].tokenId,
+        deedInfo[_tokenId].index,
+        deedInfo[_tokenId].salePrice,
+        deedInfo[_tokenId].deedDate,
+        deedInfo[_tokenId].deedHash);
+    }   
+
+    // -- Promotion -- 
+    function getAllPromoters(uint256 tokenId) public view returns(bytes32[] memory _promoters){
+       return _promoters = offerDetails[tokenId].promoters._inner._values;
+    }
+
+    function promoterAtIndex (uint256 tokenId, uint256 index) public view returns (address){
+        return offerDetails[tokenId].promoters.at(index);
+    }
+
+    function getPromoterHouses(address _promoter) public view returns(bytes32[] memory myProperties){
+        return myProperties = myPromotions[_promoter].properties._inner._values;
+    }
+
+    function sellerPromotionFee(address seller, uint256 tokenId) public view returns(uint256){
+        return sellerDeposits[seller][tokenId];
+    }
+    
+
+    /*         *** SETTER ***
+    =====================================*/
+
+    //  -- ORACLES --
+    function addOracle(address token, address oracle) public onlyOwner{
+        availableOracles[token] = oracle;
+        emit TokenAdded(token);
+    }
+
+    function removeOracle(address token) public onlyOwner{
+        delete availableOracles[token];
+        emit TokenDeleted(token);
+    }
+
+
+    // -- URI UPDATE --
+    function updateHouseUri (uint256 tokenId, string memory ipfsHash) public {
+        require(_ownsHouse(msg.sender, tokenId), "MP1");
+        require(offerDetails[tokenId].offerstate == OfferState.Dormant, "MP2");
+        require(_houseToken.isApprovedForAll(msg.sender, address(this)), "MP1");
+        
+        _houseToken.updateUri (tokenId, ipfsHash);
+        emit UriUpdated(tokenId, ipfsHash, msg.sender);
+    }
+
+
+    // -- LIST HOUSE --
+    function sellHouse(uint256 price, uint256 tokenId) public nonReentrant {
+        require(_ownsHouse(msg.sender, tokenId), "MP1.");
+        require(offerDetails[tokenId].offerstate == OfferState.Dormant, "MP2");
+        require(_houseToken.isApprovedForAll(msg.sender, address(this)), "MP1.");
+
+        // get income from houseToken
+        ( , uint256 income, ) = _houseToken.getHouse(tokenId);
+
+        // access the offer
+        Offer memory _offer = Offer(msg.sender, price, income, offers.length, tokenId, false, OfferState.Active, promoters);
+
+        offerDetails[tokenId] = _offer; //add offer to the mapping
+        offers.push(_offer); //add the offer to array
+
+        _tsaishenUsers.addPoints(msg.sender, 3); //add points to user
+
+        emit HouseListed(msg.sender, tokenId, price);
+    }
+
+    function removeOffer(uint256 tokenId) public {
+        Offer storage offer = offerDetails[tokenId]; //first access the offer
+        require(offer.seller == msg.sender, "MP1"); //ensure owner only can do this
+        require(offerDetails[tokenId].offerstate == OfferState.Active, "MP2"); //require it's active
+
+        offerDetails[tokenId].offerstate = OfferState.Dormant; //turn off active state - no longer for sale
+
+        // if there was a promotion associate with the listing, cancel that promotion
+        if(offerDetails[tokenId].isPromoted = true){
+            _cancelPromotion(tokenId);
+        }
+   
+        delete offers[offer.index]; //first delete the index within the array
+        delete offerDetails[tokenId]; //then remove the id from the mapping
+
+        emit OfferRemoved(msg.sender, tokenId);
+    }
+
+    function allowPromotion(IERC20 token, uint256 tokenId) public payable nonReentrant {
+        require(_ownsHouse(msg.sender, tokenId), "MP1"); //ensure person owns the token
+        require(offerDetails[tokenId].offerstate == OfferState.Active, "MP2"); //ensure it's activelly for sale
+
+        offerDetails[tokenId].isPromoted = true; //set the token to promoted
+
+        // track seller deposits for each property promotion
+        sellerDeposits[msg.sender][tokenId] = msg.value;   
+
+        // transfer funds from seller
+        token.universalTransferFromSenderToThis(msg.value); 
+
+        _tsaishenUsers.addPoints(msg.sender, 1); //add points to user
+
+        emit PromotionEnabled(msg.sender, tokenId);
+    }
+
+    function promoteHouse(uint256 tokenId) public {
+        require(offerDetails[tokenId].isPromoted == true, "MP1"); //ensure token is promoted before someone signs up
+        require(offerDetails[tokenId].offerstate == OfferState.Active, "MP2"); //make sure it's activelly listed for sale
+
+        offerDetails[tokenId].promoters.add(msg.sender); //add promoter to the mapping
+
+        // add properties to individual mapping
+        myPromotions[msg.sender].properties.add(tokenId);
+
+        _tsaishenUsers.addUser(msg.sender); //add user
+        _tsaishenUsers.addPoints(msg.sender, 1); //add points to user
+
+        emit PromoterSignedUp(msg.sender, tokenId);
+    }  
+
+    // -- PURCHASE OPTIONS --
+    function buyHouse (IERC20 token, uint256 tokenId) public payable nonReentrant{
+        //if token is promoted and this is not a promoted purchase, cancel promotion
+        if(offerDetails[tokenId].isPromoted = true){
+            _cancelPromotion(tokenId);
+        }
+        _buyHouse(token, tokenId); //execute buy function
+    }
+
+    function buyPromoHouse (IERC20 token, uint256 tokenId, address payable promoter) public payable nonReentrant{
+        _payPromoter(promoter, tokenId);
+        _buyHouse(token, tokenId);
+    }
+ 
+    function buyHouseWithEscrow (IERC20 token, uint256 tokenId) public payable nonReentrant{
+        if(offerDetails[tokenId].isPromoted = true){
+            _cancelPromotion(tokenId);
+        }
+        _buyHouseWithEscrow(token, tokenId);
+    }
+
+    function buyPromotedHouseWithEscrow (IERC20 token, uint256 tokenId, address payable promoter) public payable nonReentrant{
+        _payPromoter(promoter, tokenId);
+        _buyHouseWithEscrow(token, tokenId);
+    }
+
+
+    // -- ESCROW MANAGEMENT --
+    function refundEscrow(uint256 tokenId) public payable nonReentrant{
+        // to refund, it must be a seller, buyer, or contract owner
+        require(msg.sender == escrowById[tokenId].buyer || msg.sender == escrowById[tokenId].seller || msg.sender == owner(), "MP1.");
+        
+        // it most be after the timelock has expired
+        require(now > escrowById[tokenId].timelock, "MP3");
+
+        if(now >= escrowById[tokenId].timelock){
+            Offer storage offer = offerDetails[tokenId];
+            _enableRefunds(tokenId);
+            _issueRefund(escrowById[tokenId].buyer, tokenId);
+
+            offers[offer.index].offerstate = OfferState.Active;
+            offerDetails[tokenId].offerstate = OfferState.Active;
+
+            emit EscrowRefunded(escrowById[tokenId].buyer, escrowById[tokenId].seller, tokenId);
+        }
+    }
+
+    function closeEscrow(uint256 tokenId) public onlyOwner {
+        // ensure token is in escrow
+        require(offerDetails[tokenId].offerstate == OfferState.Escrow, "MP2");
+        Offer storage offer = offerDetails[tokenId];
+        
+        _resetState(tokenId);
+        _close(tokenId); //this extends timelock
+
+        emit EscrowClosed(offer.seller, tokenId);
+    }    
+
+    // seller to upload deed has and close escrow
+    function sellerComplete(uint256 _tokenId, string memory _deedHash) public {
+        require(msg.sender == escrowById[_tokenId].seller || msg.sender == owner(), "MP1");
+        require(offerDetails[_tokenId].offerstate == OfferState.Escrow, "MP2");
+        require(escrowById[_tokenId].state == State.Active, "MP2");
+
+        _addDeed(_tokenId, _deedHash);
+        _close(_tokenId);
+
+        emit DocsUploaded(msg.sender, _tokenId);
+    }
+
+    function sellerWithdraw(uint256 tokenId) public payable nonReentrant{
+        //ensure only seller can do this
+        require(msg.sender == escrowById[tokenId].seller, "MP1");
+        
+        //token is in escrow
+        require(offerDetails[tokenId].offerstate == OfferState.Escrow, "MP2");
+        
+        //escrow is closed
+        require(escrowById[tokenId].state == State.Closed, "MP2");
+        
+        //timelock has expired
+        require(now >= escrowById[tokenId].timelock, "MP3");
+        
+        //access offer
+        Offer storage offer = offerDetails[tokenId];
+
+        // transfer house to buyer
+        _houseToken.safeTransferFrom(offer.seller, escrowById[tokenId].buyer, tokenId);
+
+        _tsaishenUsers.addHouseToUser(escrowById[tokenId].buyer, tokenId); //add house to buyer
+        _tsaishenUsers.deleteHouseFromUser(offer.seller, tokenId); //remove house from seller
+        _tsaishenUsers.addPoints(msg.sender, 1); //add points to user
+
+        _beneficiaryWithdraw(offer.seller, tokenId, feeRecipient);
+        
+        //remove from the array/mapping
+        delete offers[offer.index];
+        delete offerDetails[tokenId];  
+
+        emit HousePurchased(escrowById[tokenId].buyer, escrowById[tokenId].seller, tokenId);
+    }
+
+    // buyer to verifies receipt and escrow transfers complete
+    function buyerVerify(uint256 tokenId) public payable nonReentrant{
+        require(offerDetails[tokenId].offerstate == OfferState.Escrow, "MP2");
+        Offer storage offer = offerDetails[tokenId];
+        
+        _confirmDelivery(tokenId);
+
+        // transfer house to buyer
+        _houseToken.safeTransferFrom(offer.seller, msg.sender, tokenId);
+
+        // finalize transaction with users
+        _tsaishenUsers.addHouseToUser(msg.sender, tokenId);
+        _tsaishenUsers.deleteHouseFromUser(offer.seller, tokenId);
+        _tsaishenUsers.addPoints(msg.sender, 1);
+
+        //remove from the array/mapping
+        delete offers[offer.index];
+        delete offerDetails[tokenId];  
+
+        emit HousePurchased(msg.sender, escrowById[tokenId].seller, tokenId);
+    }
+
+    // buyer notices error in documents and requests change/review
+    function buyerReviewRequest(uint256 tokenId) public {
+        require(offerDetails[tokenId].offerstate == OfferState.Escrow, "MP2");
+        require(msg.sender == escrowById[tokenId].buyer, "MP1");
+    
+        _resetState(tokenId);
+        _extendTimelock(tokenId);
+
+        emit ReviewRequest(escrowById[tokenId].buyer, escrowById[tokenId].seller, tokenId);
+    }
+
+    function finalizeEscrowTransaction(uint256 tokenId) public payable onlyOwner {
+        require(offerDetails[tokenId].offerstate == OfferState.Escrow, "MP2");
+        Offer storage offer = offerDetails[tokenId];
+
+        _resetState(tokenId);
+        _close(tokenId);
+        _cancelTimelock(tokenId);
+
+        // transfer house to buyer
+        _houseToken.safeTransferFrom(offer.seller, escrowById[tokenId].buyer, tokenId);
+
+        _beneficiaryWithdraw(offer.seller, tokenId, feeRecipient);
+
+        // finalize transaction with users
+        _tsaishenUsers.addHouseToUser(escrowById[tokenId].buyer, tokenId);
+        _tsaishenUsers.deleteHouseFromUser(offer.seller, tokenId);       
+
+        //remove from array/mapping
+        delete offers[offer.index];
+        delete offerDetails[tokenId];  
+
+        emit HousePurchased(escrowById[tokenId].buyer, offer.seller, tokenId);
+    }
+
+    function cancelEscrowSale(uint256 tokenId) public payable nonReentrant {
+        //ensure cancellation can be done by either buyer or seller only
+        require(msg.sender == escrowById[tokenId].buyer || msg.sender == escrowById[tokenId].seller, "MP1.");
+        
+        //token is in escrow
+        require(offerDetails[tokenId].offerstate == OfferState.Escrow, "MP2");
+        
+        Offer storage offer = offerDetails[tokenId];
+
+        _penalty(tokenId);
+        _cancelEscrowSale(tokenId);
+        offers[offer.index].offerstate = OfferState.Active;
+        offerDetails[tokenId].offerstate = OfferState.Active;
+
+        emit EscrowCancelled(msg.sender, tokenId);
+    }
+
+
+    //*** INTERNAL ***
+    function _ownsHouse(address _address, uint256 _tokenId) internal view returns (bool) {
+        return (_houseToken.ownerOf(_tokenId) == _address);
+    }
+
+    function _addDeed(uint256 _tokenId, string memory _deedHash) internal {
+        
+        ( , uint256 salePrice, , , , , ) = getOffer(_tokenId);
+
+        Deed memory _deed = Deed({
+            seller: escrowById[_tokenId].seller,
+            buyer: escrowById[_tokenId].buyer,
+            tokenId: _tokenId,
+            index: deeds.length,
+            salePrice: salePrice,
+            deedDate: now, 
+            deedHash: _deedHash
+        });
+
+        deedInfo[_tokenId] = _deed;
+        deeds.push(_deed);
+
+        emit DocsUploaded(msg.sender, _tokenId);
+    }
+
+    // PROMOTER
+    function _cancelPromotion(uint256 _tokenId) internal {
+        //define and access the seller information
+        address payable seller = offerDetails[_tokenId].seller;
+        
+        //locate the amount deposited
+        uint256 depositedAmount = sellerDeposits[seller][_tokenId];
+
+        //set promoted piece back to false
+        offerDetails[_tokenId].isPromoted = false;
+        
+        //set seller deposit to zero
+        sellerDeposits[seller][_tokenId] = 0;
+
+        //transfer the deposited amount back to seller
+        seller.transfer(depositedAmount);
+  
+        //delete from mapping
+        delete sellerDeposits[seller][_tokenId];
+
+        emit PromotionCancelled(seller, _tokenId);
+    }  
+
+    function _payPromoter(address payable _promoter, uint256 _tokenId) internal {     
+        //access promoter
+        address seller = offerDetails[_tokenId].seller;
+        
+        //access amount deposited for promoter's reward
+        uint256 amountToPromoter = sellerDeposits[seller][_tokenId];
+        
+        //set mapping to zero
+        sellerDeposits[seller][_tokenId] = 0;
+        
+        //transfer amount to promoter
+        _promoter.transfer(amountToPromoter);
+
+        //delete mapping
+        delete sellerDeposits[seller][_tokenId];
+
+        emit PromoterPaid(seller, _promoter, _tokenId);
+    }
+}
